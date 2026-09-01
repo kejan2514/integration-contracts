@@ -64,6 +64,59 @@ forge test
 The project pins Solidity `0.8.30`, Forge Standard Library, and OpenZeppelin Contracts through the
 Foundry lockfile and Git submodules.
 
+### XAUt Aave V4 mainnet-fork integration
+
+The opt-in fork test uses XAUt (`0x68749665FF8D2d112Fa859AA293F07A622782F38`) as real collateral
+in Aave V4's deployed Ethereum Gold Spoke. It exercises live Ethereum contracts for:
+
+- a one-XAUt supply, near-limit USDC borrow, health-factor calculation, interest accrual, and
+  liquidation in the Aave V4 Gold Spoke;
+- XAUt pricing from the same Chainlink XAU/USD feed configured in the Gold Spoke;
+- the Aave V3 Pool's USDC flash loan and premium repayment; and
+- the deployed Multiliquid swap and Uniform Labs USDC Delegate settlement path.
+
+XAUt is not registered in the deployed Multiliquid contracts at the pinned block. The test models
+that prospective integration by impersonating the existing authorized mainnet accounts and using
+the production configuration functions to:
+
+- register the fork-only asset ID `keccak256("XAUt")` with no token-level whitelist adapter;
+- install a fork-deployed Chainlink adapter that scales the eight-decimal XAU/USD answer to WAD and
+  enforces a 25-hour maximum age;
+- whitelist XAUt on the Uniform Labs USDC Delegate; and
+- set its RWA-to-USDC discount to 25 bps.
+
+No Aave contract, oracle response, liquidation, or health-factor calculation is mocked. The test
+funds the new borrower with XAUt and adds USDC to the existing delegate custody using Foundry's
+`deal` helper. It then borrows at 99.999% of the position's calculated limit and advances fork time
+in one-hour steps until real USDC interest makes the position liquidatable. A snapshot-only
+preflight through the real Spoke determines the exact collateral and debt rounding before the
+flash-liquidation transaction is executed and asserted.
+
+Start a pinned Anvil fork in one terminal using an archive-capable Ethereum RPC:
+
+```sh
+export ETHEREUM_RPC_URL=https://your-ethereum-rpc.example
+anvil \
+  --fork-url "$ETHEREUM_RPC_URL" \
+  --fork-block-number 25883433 \
+  --chain-id 1
+```
+
+Run the test in another terminal:
+
+```sh
+RUN_MAINNET_FORK_TESTS=true \
+MAINNET_FORK_RPC_URL=http://127.0.0.1:8545 \
+MAINNET_FORK_BLOCK=25883433 \
+forge test \
+  --match-path test/fork/AaveV4MultiliquidFlashLiquidatorMainnetFork.t.sol \
+  -vv
+```
+
+To exercise current mainnet state instead, omit Anvil's `--fork-block-number` argument and set
+`MAINNET_FORK_BLOCK=0` for the Forge command. The ordinary test suite skips this integration unless
+`RUN_MAINNET_FORK_TESTS=true` is set.
+
 ## License
 
 Licensed under the Apache License 2.0. See [LICENSE](LICENSE).

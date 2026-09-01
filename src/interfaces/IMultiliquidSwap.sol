@@ -17,10 +17,23 @@ interface IMultiliquidSwap {
         uint256 assetOutAmt;
     }
 
+    struct SwapResolved {
+        uint256 tokenInAmt;
+        uint256 tokenOutAmt;
+        uint256 issuerFeeAmt;
+        uint256 spreadFeeAmt;
+        uint256 lpFeeAmt;
+    }
+
     function swap(
         address user,
         address receiver,
         SwapInputs[] calldata inputs,
         ApprovalPermit calldata permit
     ) external;
+
+    function quoteSwap(address user, SwapInputs calldata inputs)
+        external
+        view
+        returns (SwapResolved memory outputs);
 }
