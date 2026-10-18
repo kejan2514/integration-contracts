@@ -229,6 +229,85 @@ contract AaveV4MultiliquidFlashLiquidatorTest is Test {
         );
     }
 
+    function test_executeLiquidation_rejectsMissingCallbackAndCanRetry() public {
+        _assertCallbackRejectedAndCanRetry(
+            MockAaveV3FlashLoanPool.CallbackMode.Skip,
+            AaveV4MultiliquidFlashLiquidator.FlashLoanCallbackIncomplete.selector
+        );
+    }
+
+    function test_executeLiquidation_rejectsWrongCallbackInitiatorAndCanRetry() public {
+        _assertCallbackRejectedAndCanRetry(
+            MockAaveV3FlashLoanPool.CallbackMode.WrongInitiator,
+            AaveV4MultiliquidFlashLiquidator.InvalidFlashLoanCallback.selector
+        );
+    }
+
+    function test_executeLiquidation_rejectsWrongCallbackAssetAndCanRetry() public {
+        _assertCallbackRejectedAndCanRetry(
+            MockAaveV3FlashLoanPool.CallbackMode.WrongAsset,
+            AaveV4MultiliquidFlashLiquidator.InvalidFlashLoanCallback.selector
+        );
+    }
+
+    function test_executeLiquidation_rejectsWrongCallbackAmountAndCanRetry() public {
+        _assertCallbackRejectedAndCanRetry(
+            MockAaveV3FlashLoanPool.CallbackMode.WrongAmount,
+            AaveV4MultiliquidFlashLiquidator.InvalidFlashLoanCallback.selector
+        );
+    }
+
+    function test_executeLiquidation_rejectsTamperedCallbackParamsAndCanRetry() public {
+        _assertCallbackRejectedAndCanRetry(
+            MockAaveV3FlashLoanPool.CallbackMode.WrongParams,
+            AaveV4MultiliquidFlashLiquidator.InvalidFlashLoanCallback.selector
+        );
+    }
+
+    function test_executeLiquidation_rejectsRepeatedCallbackAndCanRetry() public {
+        _assertCallbackRejectedAndCanRetry(
+            MockAaveV3FlashLoanPool.CallbackMode.Repeated,
+            AaveV4MultiliquidFlashLiquidator.InvalidFlashLoanCallback.selector
+        );
+    }
+
+    function _assertCallbackRejectedAndCanRetry(
+        MockAaveV3FlashLoanPool.CallbackMode mode,
+        bytes4 expectedError
+    ) private {
+        // Existing capital must survive even when the first callback completes before a replay.
+        uint256 preexistingDebt = 10e18;
+        uint256 preexistingCollateral = 7e18;
+        debtAsset.mint(address(liquidator), preexistingDebt);
+        collateralAsset.mint(address(liquidator), preexistingCollateral);
+        flashLoanPool.setCallbackMode(mode);
+
+        vm.prank(solver);
+        vm.expectRevert(expectedError);
+        liquidator.executeLiquidation(_defaultParams());
+
+        assertEq(debtAsset.balanceOf(address(liquidator)), preexistingDebt);
+        assertEq(collateralAsset.balanceOf(address(liquidator)), preexistingCollateral);
+        assertEq(debtAsset.balanceOf(address(flashLoanPool)), 1_000e18, "loan rolled back");
+        assertEq(debtAsset.balanceOf(address(liquidationSpoke)), 0, "liquidation rolled back");
+        assertEq(collateralAsset.balanceOf(address(liquidationSpoke)), 1_000e18);
+        assertEq(debtAsset.balanceOf(address(multiliquidDelegate)), 1_000e18);
+        assertEq(collateralAsset.balanceOf(address(multiliquidDelegate)), 0, "swap rolled back");
+        assertEq(debtAsset.balanceOf(solver), 0, "no profit paid");
+        assertEq(debtAsset.allowance(address(liquidator), address(flashLoanPool)), 0);
+        assertEq(debtAsset.allowance(address(liquidator), address(liquidationSpoke)), 0);
+        assertEq(collateralAsset.allowance(address(liquidator), address(multiliquidDelegate)), 0);
+
+        // A revert must also roll back the private execution guard and authorization hash.
+        flashLoanPool.setCallbackMode(MockAaveV3FlashLoanPool.CallbackMode.Normal);
+        vm.prank(solver);
+        uint256 profit = liquidator.executeLiquidation(_defaultParams());
+        assertEq(profit, EXPECTED_PROFIT);
+        assertEq(debtAsset.balanceOf(solver), EXPECTED_PROFIT);
+        assertEq(debtAsset.balanceOf(address(liquidator)), preexistingDebt);
+        assertEq(collateralAsset.balanceOf(address(liquidator)), preexistingCollateral);
+    }
+
     function _defaultParams()
         private
         view
@@ -251,8 +330,19 @@ contract AaveV4MultiliquidFlashLiquidatorTest is Test {
 contract MockAaveV3FlashLoanPool is IAaveV3FlashLoanPool {
     using SafeERC20 for IERC20;
 
+    enum CallbackMode {
+        Normal,
+        Skip,
+        WrongInitiator,
+        WrongAsset,
+        WrongAmount,
+        WrongParams,
+        Repeated
+    }
+
     IERC20 public immutable DEBT_ASSET;
     uint256 public immutable PREMIUM;
+    CallbackMode public callbackMode;
 
     error InvalidFlashAsset();
     error InvalidReceiverReturn();
@@ -261,6 +351,10 @@ contract MockAaveV3FlashLoanPool is IAaveV3FlashLoanPool {
     constructor(IERC20 debtAsset, uint256 premium) {
         DEBT_ASSET = debtAsset;
         PREMIUM = premium;
+    }
+
+    function setCallbackMode(CallbackMode mode) external {
+        callbackMode = mode;
     }
 
     function flashLoanSimple(
@@ -275,9 +369,22 @@ contract MockAaveV3FlashLoanPool is IAaveV3FlashLoanPool {
         uint256 balanceBefore = DEBT_ASSET.balanceOf(address(this));
         DEBT_ASSET.safeTransfer(receiverAddress, amount);
 
+        if (callbackMode == CallbackMode.Skip) return;
+
+        address callbackAsset = callbackMode == CallbackMode.WrongAsset ? address(0) : asset;
+        uint256 callbackAmount = callbackMode == CallbackMode.WrongAmount ? amount + 1 : amount;
+        address initiator = callbackMode == CallbackMode.WrongInitiator ? address(this) : msg.sender;
+        bytes memory callbackParams =
+            callbackMode == CallbackMode.WrongParams ? bytes.concat(params, hex"01") : params;
+
         bool success = IAaveV3FlashLoanSimpleReceiver(receiverAddress)
-            .executeOperation(asset, amount, PREMIUM, msg.sender, params);
+            .executeOperation(callbackAsset, callbackAmount, PREMIUM, initiator, callbackParams);
         if (!success) revert InvalidReceiverReturn();
+
+        if (callbackMode == CallbackMode.Repeated) {
+            IAaveV3FlashLoanSimpleReceiver(receiverAddress)
+                .executeOperation(asset, amount, PREMIUM, msg.sender, params);
+        }
 
         DEBT_ASSET.safeTransferFrom(receiverAddress, address(this), amount + PREMIUM);
         if (DEBT_ASSET.balanceOf(address(this)) != balanceBefore + PREMIUM) {
